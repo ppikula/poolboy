@@ -16,7 +16,9 @@
     workers :: queue(),
     waiting :: queue(),
     monitors :: ets:tid(),
+    timers :: ets:tid(),
     size = 5 :: non_neg_integer(),
+    idle_timeout = 0 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer()
 }).
@@ -105,7 +107,8 @@ init({PoolArgs, WorkerArgs}) ->
     process_flag(trap_exit, true),
     Waiting = queue:new(),
     Monitors = ets:new(monitors, [private]),
-    init(PoolArgs, WorkerArgs, #state{waiting = Waiting, monitors = Monitors}).
+    TimerRefs = ets:new(timers, [private]),
+    init(PoolArgs, WorkerArgs, #state{waiting = Waiting, monitors = Monitors, timers=TimerRefs}).
 
 init([{worker_module, Mod} | Rest], WorkerArgs, State) when is_atom(Mod) ->
     {ok, Sup} = poolboy_sup:start_link(Mod, WorkerArgs),
@@ -114,6 +117,8 @@ init([{size, Size} | Rest], WorkerArgs, State) when is_integer(Size) ->
     init(Rest, WorkerArgs, State#state{size = Size});
 init([{max_overflow, MaxOverflow} | Rest], WorkerArgs, State) when is_integer(MaxOverflow) ->
     init(Rest, WorkerArgs, State#state{max_overflow = MaxOverflow});
+init([{idle_timeout, IdleTimeout} | Rest], WorkerArgs, State) when is_integer(IdleTimeout) ->
+    init(Rest, WorkerArgs, State#state{idle_timeout = IdleTimeout});
 init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
 init([], _WorkerArgs, #state{size = Size, supervisor = Sup} = State) ->
@@ -137,14 +142,31 @@ handle_cast(_Msg, State) ->
 handle_call({checkout, Block, Deadline}, {FromPid, _} = From, State) ->
     #state{supervisor = Sup,
            workers = Workers,
+           timers = Timers,
            monitors = Monitors,
            overflow = Overflow,
            max_overflow = MaxOverflow} = State,
     case queue:out(Workers) of
         {{value, Pid}, Left} ->
-            Ref = erlang:monitor(process, FromPid),
-            true = ets:insert(Monitors, {Pid, Ref}),
-            {reply, Pid, State#state{workers = Left}};
+            case ets:lookup(Timers,Pid) of
+                [] -> 
+                    Ref = erlang:monitor(process, FromPid),
+                    true = ets:insert(Monitors, {Pid, Ref}),
+                    {reply, Pid, State#state{workers = Left}}; 
+                [{_,TimerRef}] -> 
+                    case erlang:cancel_timer(TimerRef) of 
+                        false -> 
+                            T = {checkout,Block,Deadline},
+                            handle_call(T,From,State#state{workers = Left});
+                        _Time ->
+                            Ref = erlang:monitor(process, FromPid),
+                            true = ets:insert(Monitors, {Pid, Ref}),
+                            true = ets:delete(Timers, Pid),
+                            {reply, Pid, State#state{workers = Left}}
+                    end
+            end;
+
+
         {empty, Empty} when MaxOverflow > 0, Overflow < MaxOverflow ->
             {Pid, Ref} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, Ref}),
@@ -215,6 +237,19 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             end
     end;
 
+handle_info({terminate_worker,Pid},State) ->
+    #state{supervisor = Sup,
+           workers = Workers,
+           overflow = Overflow} = State,
+    case queue:peek(Workers)  of 
+        {value, Pid} when Overflow >0  -> 
+            {{value,_},NewWorkers} = queue:out(Workers),
+            ok = dismiss_worker(Sup, Pid),
+            {noreply,State#state{workers =NewWorkers, overflow=Overflow-1}};
+        _ ->
+            {noreply,State}
+    end; 
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -265,9 +300,11 @@ past_deadline(Deadline) ->
     timer:now_diff(os:timestamp(), Deadline) < 0.
 
 handle_checkin(Pid, State) ->
-    #state{supervisor = Sup,
+    #state{idle_timeout = IdleTimeout,
+           supervisor = Sup,
            waiting = Waiting,
            monitors = Monitors,
+           timers = Timers,
            overflow = Overflow} = State,
     case queue:out(Waiting) of
         {{value, {{FromPid, _} = From, Deadline}}, Left} ->
@@ -280,6 +317,11 @@ handle_checkin(Pid, State) ->
                 true ->
                     handle_checkin(Pid, State#state{waiting = Left})
             end;
+        {empty, Empty} when Overflow > 0, IdleTimeout > 0 -> 
+            Ref = erlang:send_after(IdleTimeout,self(),{terminate_worker,Pid}),
+            true = ets:insert(Timers,{Pid,Ref}),
+            Workers = queue:in(Pid, State#state.workers),
+            State#state{workers=Workers, waiting = Empty, overflow = Overflow};
         {empty, Empty} when Overflow > 0 ->
             ok = dismiss_worker(Sup, Pid),
             State#state{waiting = Empty, overflow = Overflow - 1};

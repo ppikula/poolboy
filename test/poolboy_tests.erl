@@ -53,6 +53,9 @@ pool_test_() ->
             },
             {<<"Pool returns status">>,
                 fun pool_returns_status/0
+            },
+            {<<"Unused workers are dismissed after idle timeout ">>,
+                fun pool_dissmiss_unused/0
             }
         ]
     }.
@@ -394,6 +397,33 @@ pool_returns_status() ->
     {ok, Pool4} = new_pool(0, 0),
     ?assertEqual({full, 0, 0, 0}, poolboy:status(Pool4)),
     ok = ?sync(Pool4, stop).
+
+
+pool_dissmiss_unused() -> 
+    {ok, Pool} = poolboy:start_link([{name,{local,poolboy_test}},
+                                     {worker_module,poolboy_test_worker},
+                                     {size,1},{max_overflow,1},{idle_timeout,1000}]),
+    ?assertEqual({ready, 1, 0, 0}, poolboy:status(Pool)),
+    poolboy:checkout(Pool),
+    ?assertEqual({overflow, 0, 0, 1}, poolboy:status(Pool)),
+    Worker=poolboy:checkout(Pool),
+    ?assertEqual({full, 0, 1, 2}, poolboy:status(Pool)),
+    checkin_worker(Pool, Worker), % 500 ms sleep inside 
+    ?assertEqual(true, is_process_alive(Worker)),
+    timer:sleep(1000),
+    ?assertEqual(false, is_process_alive(Worker)),%% should be dead by now
+
+    Worker2=poolboy:checkout(Pool),
+    ?assertEqual({full, 0, 1, 2}, poolboy:status(Pool)),
+    checkin_worker(Pool, Worker2), % 500 ms sleep inside 
+    ?assertEqual(true, is_process_alive(Worker2)),
+    Worker2=poolboy:checkout(Pool),% the same worker should cancel timer
+    checkin_worker(Pool, Worker2), % 500 ms sleep inside
+    ?assertEqual(true, is_process_alive(Worker2)),
+    timer:sleep(600),
+    ?assertEqual(false, is_process_alive(Worker2)),
+
+    ok = ?sync(Pool,stop).
 
 new_pool(Size, MaxOverflow) ->
     poolboy:start_link([{name, {local, poolboy_test}},
