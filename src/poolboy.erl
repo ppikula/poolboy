@@ -143,9 +143,11 @@ handle_call({checkout, Block, Deadline}, {FromPid, _} = From, State) ->
     #state{supervisor = Sup,
            workers = Workers,
            timers = Timers,
+           size = Size,
            monitors = Monitors,
            overflow = Overflow,
            max_overflow = MaxOverflow} = State,
+    WorkerCount = proplists:get_value(workers,supervisor:count_children(Sup)),
     case queue:out(Workers) of
         {{value, Pid}, Left} ->
             case ets:lookup(Timers,Pid) of
@@ -165,8 +167,10 @@ handle_call({checkout, Block, Deadline}, {FromPid, _} = From, State) ->
                             {reply, Pid, State#state{workers = Left}}
                     end
             end;
-
-
+        {empty, Empty} when WorkerCount < Size ->
+            {Pid, Ref} = new_worker(Sup, FromPid),
+            true = ets:insert(Monitors, {Pid, Ref}),
+            {reply, Pid, State#state{workers = Empty}};
         {empty, Empty} when MaxOverflow > 0, Overflow < MaxOverflow ->
             {Pid, Ref} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, Ref}),
@@ -213,24 +217,28 @@ handle_info({'DOWN', Ref, _, _, _}, State) ->
             %% a race condition with messages waiting in the
             %% mailbox.
             true = ets:delete(State#state.monitors, Pid),
-            NewState = handle_worker_exit(Pid, State),
+            NewState = handle_worker_exit(Pid, State,killed),
             {noreply, NewState};
         [] ->
             {noreply, State}
     end;
-handle_info({'EXIT', Pid, _Reason}, State) ->
+handle_info({'EXIT', Pid, Reason}, State) ->
     #state{supervisor = Sup,
            idle_timeout = IdleTimeout,
            timers = Timers,
-           monitors = Monitors} = State,
+           monitors = Monitors,
+           overflow = Overflow} = State,
     case ets:lookup(Monitors, Pid) of
         [{Pid, Ref}] ->
             true = erlang:demonitor(Ref),
             true = ets:delete(Monitors, Pid),
-            NewState = handle_worker_exit(Pid, State),
+            NewState = handle_worker_exit(Pid, State,Reason),
             {noreply, NewState};
         [] ->
             case queue:member(Pid, State#state.workers) of
+                true when Reason=:={error,normal} ->
+                    {noreply, State#state{workers = queue:filter(fun(P) -> P=/= Pid end, State#state.workers),
+                                         overflow = erlang:max(0,Overflow-1)}};
                 true ->
                     W = queue:filter(fun (P) -> P =/= Pid end, State#state.workers),
                     NewWorker = new_worker(Sup),
@@ -339,7 +347,7 @@ handle_checkin(Pid, State) ->
             State#state{workers = Workers, waiting = Empty, overflow = 0}
     end.
 
-handle_worker_exit(Pid, State) ->
+handle_worker_exit(Pid, State, Reason) ->
     #state{supervisor = Sup,
            monitors = Monitors,
            idle_timeout = IdleTimeout,
@@ -355,10 +363,13 @@ handle_worker_exit(Pid, State) ->
                     gen_server:reply(From, NewWorker),
                     State#state{waiting = LeftWaiting};
                 true ->
-                    handle_worker_exit(Pid, State#state{waiting = LeftWaiting})
+                    handle_worker_exit(Pid, State#state{waiting = LeftWaiting},Reason)
             end;
         {empty, Empty} when Overflow > 0, IdleTimeout < 1 ->
             State#state{overflow = Overflow - 1, waiting = Empty};
+        {empty, Empty} when Reason =:= normal ->
+            State#state{workers= queue:filter(fun(P) -> P=/=Pid end, State#state.workers),
+                        waiting = Empty};
         {empty, Empty} ->
             NewWorker = new_worker(Sup),
             dismiss_worker_after(NewWorker,Timers,IdleTimeout),
@@ -376,7 +387,10 @@ state_name(State = #state{overflow = Overflow}) when Overflow < 1 ->
         true -> overflow;
         false -> ready
     end;
-state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
-    full;
+state_name(#state{workers = Workers,overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
+    case queue:len(Workers) == 0 of
+        true -> full;
+        false -> ready
+    end; 
 state_name(_State) ->
     overflow.

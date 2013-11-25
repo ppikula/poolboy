@@ -56,6 +56,9 @@ pool_test_() ->
             },
             {<<"Unused workers are dismissed after idle timeout ">>,
                 fun pool_dissmiss_unused/0
+            },
+            {<<"Pool does not restart workers which died normally">>,
+                fun pool_worker_exits_normally/0
             }
         ]
     }.
@@ -64,6 +67,13 @@ pool_test_() ->
 kill_worker(Pid) ->
     erlang:monitor(process, Pid),
     gen_server:call(Pid, die),
+    receive
+        {'DOWN', _, process, Pid, _} ->
+            ok
+    end.
+exit_worker_normally(Pid) ->
+    erlang:monitor(process, Pid),
+    gen_server:call(Pid, exit_normal),
     receive
         {'DOWN', _, process, Pid, _} ->
             ok
@@ -424,6 +434,26 @@ pool_dissmiss_unused() ->
     ?assertEqual(false, is_process_alive(Worker2)),
 
     ok = ?sync(Pool,stop).
+
+pool_worker_exits_normally() ->
+    {ok, Pool} = poolboy:start_link([{name,{local,poolboy_test}},
+                                     {worker_module,poolboy_test_worker},
+                                     {size,1},{max_overflow,1},{idle_timeout,2000}]),
+    ?assertEqual({ready, 1, 0, 0}, poolboy:status(Pool)),
+    P = poolboy:checkout(Pool),
+    checkin_worker(Pool,P),
+    ?assertEqual(true, is_process_alive(P)),
+    exit_worker_normally(P),
+    ?assertEqual(false, is_process_alive(P)),
+    ?assertEqual({overflow, 0, 0, 0}, poolboy:status(Pool)),
+    P2 = poolboy:checkout(Pool),
+    ?assertEqual({overflow, 0, 0, 1}, poolboy:status(Pool)),
+    P3 = poolboy:checkout(Pool),
+    ?assertEqual({full, 0, 1, 2}, poolboy:status(Pool)),
+    checkin_worker(Pool,P2),
+    checkin_worker(Pool,P3),
+    ?assertEqual({ready, 2, 1, 0}, poolboy:status(Pool)),
+    ok = ?sync(Pool, stop).
 
 new_pool(Size, MaxOverflow) ->
     poolboy:start_link([{name, {local, poolboy_test}},
