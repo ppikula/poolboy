@@ -236,7 +236,7 @@ handle_info({'EXIT', Pid, Reason}, State) ->
             {noreply, NewState};
         [] ->
             case queue:member(Pid, State#state.workers) of
-                true when Reason=:={error,normal} ->
+                true when Reason=:= normal ->
                     {noreply, State#state{workers = queue:filter(fun(P) -> P=/= Pid end, State#state.workers),
                                          overflow = erlang:max(0,Overflow-1)}};
                 true ->
