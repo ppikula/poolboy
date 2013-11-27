@@ -220,6 +220,8 @@ handle_info({'DOWN', Ref, _, _, _}, State) ->
     end;
 handle_info({'EXIT', Pid, _Reason}, State) ->
     #state{supervisor = Sup,
+           idle_timeout = IdleTimeout,
+           timers = Timers,
            monitors = Monitors} = State,
     case ets:lookup(Monitors, Pid) of
         [{Pid, Ref}] ->
@@ -231,16 +233,19 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             case queue:member(Pid, State#state.workers) of
                 true ->
                     W = queue:filter(fun (P) -> P =/= Pid end, State#state.workers),
-                    {noreply, State#state{workers = queue:in(new_worker(Sup), W)}};
+                    NewWorker = new_worker(Sup),
+                    dismiss_worker_after(NewWorker,Timers,IdleTimeout),
+                    {noreply, State#state{workers = queue:in(NewWorker, W)}};
                 false ->
                     {noreply, State}
             end
     end;
-
 handle_info({terminate_worker,Pid},State) ->
     #state{supervisor = Sup,
+           timers = Timers,
            workers = Workers,
            overflow = Overflow} = State,
+    true=ets:delete(Timers,Pid),
     case queue:peek(Workers)  of 
         {value, Pid} when Overflow >0  -> 
             {{value,_},NewWorkers} = queue:out(Workers),
@@ -276,6 +281,12 @@ new_worker(Sup, FromPid) ->
     Pid = new_worker(Sup),
     Ref = erlang:monitor(process, FromPid),
     {Pid, Ref}.
+
+dismiss_worker_after(_Pid,_Timers,0) ->
+    ok;
+dismiss_worker_after(Pid,Timers,Timeout) ->
+    Ref = erlang:send_after(Timeout,self(),{terminate_worker,Pid}),
+    true = ets:insert(Timers,{Pid,Ref}).
 
 dismiss_worker(Sup, Pid) ->
     true = unlink(Pid),
@@ -317,9 +328,8 @@ handle_checkin(Pid, State) ->
                 true ->
                     handle_checkin(Pid, State#state{waiting = Left})
             end;
-        {empty, Empty} when Overflow > 0, IdleTimeout > 0 -> 
-            Ref = erlang:send_after(IdleTimeout,self(),{terminate_worker,Pid}),
-            true = ets:insert(Timers,{Pid,Ref}),
+        {empty, Empty} when Overflow > 0, IdleTimeout > 0 ->
+            dismiss_worker_after(Pid,Timers,IdleTimeout),
             Workers = queue:in(Pid, State#state.workers),
             State#state{workers=Workers, waiting = Empty, overflow = Overflow};
         {empty, Empty} when Overflow > 0 ->
@@ -333,6 +343,8 @@ handle_checkin(Pid, State) ->
 handle_worker_exit(Pid, State) ->
     #state{supervisor = Sup,
            monitors = Monitors,
+           idle_timeout = IdleTimeout,
+           timers = Timers,
            overflow = Overflow} = State,
     case queue:out(State#state.waiting) of
         {{value, {{FromPid, _} = From, Deadline}}, LeftWaiting} ->
@@ -346,11 +358,13 @@ handle_worker_exit(Pid, State) ->
                 true ->
                     handle_worker_exit(Pid, State#state{waiting = LeftWaiting})
             end;
-        {empty, Empty} when Overflow > 0 ->
+        {empty, Empty} when Overflow > 0, IdleTimeout < 1 ->
             State#state{overflow = Overflow - 1, waiting = Empty};
         {empty, Empty} ->
+            NewWorker = new_worker(Sup),
+            dismiss_worker_after(NewWorker,Timers,IdleTimeout),
             Workers = queue:in(
-                new_worker(Sup),
+                NewWorker,
                 queue:filter(fun (P) -> P =/= Pid end, State#state.workers)
             ),
             State#state{workers = Workers, waiting = Empty}
