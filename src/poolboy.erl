@@ -246,15 +246,14 @@ handle_info({terminate_worker,Pid},State) ->
            workers = Workers,
            overflow = Overflow} = State,
     true=ets:delete(Timers,Pid),
-    case queue:peek(Workers)  of 
-        {value, Pid} when Overflow >0  -> 
-            {{value,_},NewWorkers} = queue:out(Workers),
+    case queue:member(Pid,Workers) of
+        true when Overflow>0 ->
+            W = queue:filter(fun (P) -> P =/= Pid end, State#state.workers),
             ok = dismiss_worker(Sup, Pid),
-            {noreply,State#state{workers =NewWorkers, overflow=Overflow-1}};
+            {noreply,State#state{workers = W,overflow = Overflow-1}};
         _ ->
             {noreply,State}
-    end; 
-
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
